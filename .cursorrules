@@ -1,0 +1,60 @@
+# Bombardilo Crocodallo - VoIP + Real-time Audio AI System
+
+## Development Environment
+- **Operating System**: Windows
+- **Shell**: PowerShell
+- **Commands**: Use PowerShell syntax for all terminal commands
+  - Environment variables: `$env:VARIABLE_NAME="value"` (not `export VARIABLE_NAME=value`)
+  - Path separators: Use backslashes `\` for Windows paths, forward slashes `/` for URLs
+  - Line continuation: Use backtick `` ` `` (not `\`)
+  - Command chaining: Use `;` or separate commands on new lines
+
+## Project Context
+This is a VoIP system that bridges Asterisk to real-time voice AI using ARI + External Media (RTP).
+
+## Architecture
+- **Asterisk**: Handles SIP calls, uses PJSIP and ARI
+- **ARI Orchestrator**: Node.js/TypeScript service managing call lifecycle via ARI WebSocket
+- **Media Service**: RTP endpoint handling audio processing, VAD, barge-in, ASR/TTS integration
+- **AI Integration**: Pluggable ASR, LLM, TTS providers
+
+## Code Style
+- **Language**: TypeScript for orchestrator, Python for media service (DSP practicality)
+- **Format**: Use Prettier/ESLint for TypeScript, Black for Python
+- **Audio**: 8 kHz mono PCMU (ulaw) on Asterisk side, resample internally as needed
+- **Packetization**: 20ms frames typical
+- **Error Handling**: Structured logging with correlation IDs (call_id, asterisk_channel_id, bridge_id, external_channel_id)
+
+## Key Principles
+1. MVP first, production hardening second
+2. Configuration via environment variables
+3. Structured logging with correlation IDs
+4. Idempotent cleanup on hangup
+5. Pluggable AI providers (mock implementations for testing)
+6. Clear separation of concerns: orchestrator handles ARI, media service handles RTP/DSP
+
+## File Organization
+- `/asterisk`: Configuration files and setup notes
+- `/orchestrator`: Node.js/TypeScript ARI service
+- `/media-service`: Python RTP endpoint and audio processing
+- `/docker-compose.yml`: Container orchestration
+- `/README.md`: Comprehensive setup and troubleshooting guide
+
+## Testing Strategy
+- Start with echo/loopback mode for validation
+- Then TTS-only "hello" mode
+- Finally full ASR→LLM→TTS loop
+- Use softphone for local testing
+
+## Security
+- ARI HTTP bound to localhost/private network
+- Document firewall requirements
+- No hardcoded credentials
+
+## Windows-Specific Notes
+- Use PowerShell for all command examples
+- Docker commands work the same, but use PowerShell syntax for environment variables
+- For native setup on Windows, consider WSL2 for Linux-based services (Asterisk) or use Docker
+- Path handling: Use PowerShell's path resolution (`Join-Path`, `Resolve-Path`) when needed
+- File permissions: Windows ACLs may differ from Unix permissions
+- Port binding: Windows firewall may require explicit rules for RTP ports (10000-20000 UDP)
