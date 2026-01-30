@@ -104,6 +104,38 @@ docker-compose up -d
 # Try barge-in: speak while AI is talking
 ```
 
+#### Enable “real” TTS (speech)
+
+By default, `TTS_PROVIDER=mock` generates a tone. To get actual spoken audio, configure the HTTP TTS adapter:
+
+```bash
+# Media service env vars
+export TTS_PROVIDER=http
+export TTS_BASE_URL=https://api.openai.com
+export TTS_API_KEY=...           # required for OpenAI
+export TTS_VOICE=alloy
+export TTS_TIMEOUT_MS=30000
+```
+
+#### Orpheus local TTS server (French)
+
+Run [Orpheus-FastAPI](https://raw.githubusercontent.com/Lex-au/Orpheus-FastAPI/main/README.md) locally (default `http://localhost:5005`) and point the media service to it:
+
+```bash
+export TTS_PROVIDER=http
+export TTS_BASE_URL=http://localhost:5005
+export TTS_API_KEY=not-needed
+export TTS_MODEL=orpheus
+export TTS_RESPONSE_FORMAT=wav
+export TTS_VOICE=pierre   # or: amelie, marie
+```
+
+If you run `media-service` in Docker but Orpheus-FastAPI on your Windows host, use:
+
+```bash
+export TTS_BASE_URL=http://host.docker.internal:5005
+```
+
 ## Native Setup (Without Docker)
 
 ### 1. Install Asterisk
@@ -146,7 +178,7 @@ export MEDIA_API_PORT=5000
 export MEDIA_MODE=full
 export ASR_PROVIDER=mock
 export LLM_PROVIDER=mock
-export TTS_PROVIDER=mock
+export TTS_PROVIDER=mock  # or: http (see above)
 
 python -m src.media_service
 ```

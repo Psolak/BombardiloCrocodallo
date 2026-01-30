@@ -1,6 +1,7 @@
 import * as ari from 'ari-client';
 import { createLogger, format, transports } from 'winston';
 import { CallSession } from './call-session';
+import { URL } from 'url';
 
 // Configuration from environment variables
 const config = {
@@ -21,6 +22,28 @@ const config = {
   },
   logLevel: process.env.LOG_LEVEL || 'info',
 };
+
+function getAsteriskRtpHostFallback(): string {
+  // In Docker, Asterisk sometimes reports 127.0.0.1 for UNICASTRTP_LOCAL_ADDRESS,
+  // which is only valid inside the Asterisk container. From the media-service container,
+  // we must use the docker DNS name (or an IP) to reach Asterisk.
+  try {
+    const u = new URL(config.ari.url);
+    return u.hostname || 'asterisk';
+  } catch {
+    return 'asterisk';
+  }
+}
+
+function normalizeAsteriskRtpHost(host: string | null): string | null {
+  if (!host) return null;
+  const h = host.trim();
+  if (!h) return null;
+  if (h === '127.0.0.1' || h === 'localhost' || h === '::1') {
+    return getAsteriskRtpHostFallback();
+  }
+  return h;
+}
 
 // Structured logger with correlation ID support
 const logger = createLogger({
@@ -308,26 +331,29 @@ async function main() {
               hasAddress: !!asteriskRtpAddress,
               hasPort: !!asteriskRtpPort,
             });
-            if (asteriskRtpAddress && asteriskRtpPort) {
+            const normalizedRtpHost = normalizeAsteriskRtpHost(asteriskRtpAddress);
+            if (normalizedRtpHost && asteriskRtpPort) {
               logger.info('Attempting to update media service RTP address', {
                 call_id: callId,
                 api_url: `${config.media.apiUrl}/sessions/${callId}/rtp-address`,
-                remote_host: asteriskRtpAddress,
+                remote_host: normalizedRtpHost,
                 remote_port: asteriskRtpPort,
+                original_remote_host: asteriskRtpAddress,
               });
               try {
                 const updateResponse = await fetch(`${config.media.apiUrl}/sessions/${callId}/rtp-address`, {
                   method: 'PUT',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
-                    remote_host: asteriskRtpAddress,
+                    remote_host: normalizedRtpHost,
                     remote_port: asteriskRtpPort,
                   }),
                 });
                 if (updateResponse.ok) {
                   logger.info('Updated media service with Asterisk RTP address', {
                     call_id: callId,
-                    rtp_address: `${asteriskRtpAddress}:${asteriskRtpPort}`,
+                    rtp_address: `${normalizedRtpHost}:${asteriskRtpPort}`,
+                    original_rtp_address: `${asteriskRtpAddress}:${asteriskRtpPort}`,
                   });
                 } else {
                   logger.warn('Failed to update media service RTP address', {

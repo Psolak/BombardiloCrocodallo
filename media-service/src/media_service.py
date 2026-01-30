@@ -73,6 +73,9 @@ class MediaSession:
         self.tts_active = False
         self.conversation_history: list[dict] = []
         self._receive_task: Optional[asyncio.Task] = None
+        self._rtp_ready = asyncio.Event()
+        self._greeting_task: Optional[asyncio.Task] = None
+        self._greeting_sent = False
         
         # System prompt
         system_prompt = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
@@ -153,13 +156,33 @@ class MediaSession:
                 logger.warning(f"Could not send initial silence packet: {json.dumps(error_details)}")
                 logger.debug(f"Traceback: {traceback.format_exc()}")
         
-        # Send initial greeting if TTS-only or full mode
+        # Send initial greeting if TTS-only or full mode.
+        # IMPORTANT: only speak once RTP address is known, otherwise we may send to a placeholder.
         if self.mode in ["tts_only", "full"]:
-            await self._send_greeting()
+            self._greeting_task = asyncio.create_task(self._send_greeting_when_rtp_ready())
     
+    async def _send_greeting_when_rtp_ready(self):
+        try:
+            await asyncio.wait_for(self._rtp_ready.wait(), timeout=15.0)
+        except asyncio.TimeoutError:
+            logger.warning("RTP not ready; skipping greeting", {
+                "session_id": self.session_id,
+                "remote_addr": self.remote_addr,
+            })
+            return
+
+        if not self.running or self._greeting_sent:
+            return
+
+        self._greeting_sent = True
+        await self._send_greeting()
+
     async def _send_greeting(self):
         """Send initial greeting via TTS."""
-        greeting = "Hello! I'm ready to help. How can I assist you today?"
+        greeting = os.getenv(
+            "GREETING_TEXT",
+            "Hello! I'm ready to help. How can I assist you today?",
+        )
         await self._synthesize_and_send(greeting)
     
     async def _receive_loop(self):
@@ -218,6 +241,7 @@ class MediaSession:
                         "from_addr": addr,
                         "packet_size": len(data)
                     })
+                    self._rtp_ready.set()
                 
                 # Update remote address if changed
                 if addr != self.remote_addr:
@@ -227,6 +251,7 @@ class MediaSession:
                         "new_addr": addr
                     })
                     self.remote_addr = addr
+                    self._rtp_ready.set()
                 
                 # Parse RTP packet
                 result = self.rtp_handler.parse_packet(data)
@@ -363,29 +388,47 @@ class MediaSession:
         })
         
         try:
+            started_at = asyncio.get_event_loop().time()
+            first_audio_sent = False
             async for audio_chunk in self.tts_client.synthesize_stream(text):
                 if not self.tts_active:
                     # Barge-in occurred, stop sending
                     break
                 await self._send_audio_frame(audio_chunk)
+                if not first_audio_sent:
+                    first_audio_sent = True
+                    ttf_audio_ms = int((asyncio.get_event_loop().time() - started_at) * 1000)
+                    logger.info("TTS time-to-first-audio", {
+                        "session_id": self.session_id,
+                        "ttf_audio_ms": ttf_audio_ms
+                    })
+                # Pace RTP output to real-time frames (20ms)
+                await asyncio.sleep(self.frame_duration_ms / 1000.0)
             
             self.tts_active = False
             logger.info(f"TTS synthesis completed", {
                 "session_id": self.session_id
             })
         except Exception as e:
-            logger.error(f"Error in TTS synthesis", {
-                "session_id": self.session_id,
-                "error": str(e)
-            })
+            import traceback
+            # NOTE: logging format is message-only, so embed context/traceback in the message.
+            logger.error(
+                f"TTS synthesis failed (session_id={self.session_id}, error_type={type(e).__name__}, error={e})"
+            )
+            logger.error(f"TTS synthesis traceback (session_id={self.session_id}): {traceback.format_exc()}")
             self.tts_active = False
     
-    async def _send_audio_frame(self, pcm_audio: np.ndarray):
-        """Send audio frame as RTP packet."""
+    async def _send_audio_frame(self, pcm_audio: "np.ndarray | bytes | bytearray | memoryview"):
+        """Send a single 20ms PCM16 frame as RTP packet."""
+        if not self.running:
+            return
         if not self.socket:
             logger.warning("Cannot send audio: socket not available", {
                 "session_id": self.session_id
             })
+            return
+        if self.socket.fileno() < 0:
+            # Socket already closed (can happen during hangup/cleanup races).
             return
         
         if not self.remote_addr:
@@ -394,9 +437,21 @@ class MediaSession:
             })
             return
         
-        # Ensure correct dtype and shape
+        # Accept either bytes (PCM16 little-endian) or numpy int16 samples.
+        if isinstance(pcm_audio, (bytes, bytearray, memoryview)):
+            pcm_audio = np.frombuffer(pcm_audio, dtype=np.dtype("<i2"))
+        elif not isinstance(pcm_audio, np.ndarray):
+            raise TypeError(f"Unsupported pcm_audio type: {type(pcm_audio).__name__}")
+
+        # Ensure correct dtype
         if pcm_audio.dtype != np.int16:
-            pcm_audio = pcm_audio.astype(np.int16)
+            pcm_audio = pcm_audio.astype(np.int16, copy=False)
+
+        # Ensure exact 20ms frame length (pad or trim defensively)
+        if pcm_audio.size < self.samples_per_frame:
+            pcm_audio = np.pad(pcm_audio, (0, self.samples_per_frame - pcm_audio.size))
+        elif pcm_audio.size > self.samples_per_frame:
+            pcm_audio = pcm_audio[: self.samples_per_frame]
         
         # Encode PCM16 to ulaw
         ulaw_data = linear_to_ulaw(pcm_audio)
@@ -408,6 +463,22 @@ class MediaSession:
         try:
             loop = asyncio.get_event_loop()
             await loop.sock_sendto(self.socket, rtp_packet, self.remote_addr)
+        except OSError as e:
+            # Ignore "Bad file descriptor" if teardown raced with send.
+            if getattr(e, "errno", None) == 9:
+                return
+            import traceback
+            error_details = {
+                "session_id": self.session_id,
+                "remote_addr": self.remote_addr,
+                "remote_addr_type": type(self.remote_addr).__name__ if self.remote_addr else None,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+            logger.error(f"Error sending RTP packet: {json.dumps(error_details)}")
+            # NOTE: logging is configured to only print the message, so embed traceback in the message.
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return
         except Exception as e:
             import traceback
             error_details = {
@@ -425,6 +496,15 @@ class MediaSession:
     async def stop(self):
         """Stop the media session."""
         self.running = False
+        self.tts_active = False
+        self._rtp_ready.set()
+
+        if self._greeting_task and not self._greeting_task.done():
+            self._greeting_task.cancel()
+            try:
+                await self._greeting_task
+            except asyncio.CancelledError:
+                pass
         
         # Cancel receive task
         if self._receive_task and not self._receive_task.done():
@@ -439,6 +519,7 @@ class MediaSession:
         
         if self.socket:
             self.socket.close()
+            self.socket = None
         
         logger.info(f"Media session stopped", {
             "session_id": self.session_id
@@ -485,7 +566,7 @@ class MediaService:
         asr_client = create_asr_client(asr_provider)
         llm_client = create_llm_client(llm_provider, 
                                       system_prompt=os.getenv("SYSTEM_PROMPT", "You are a helpful assistant."))
-        tts_client = create_tts_client(tts_provider, sample_rate=8000)
+        tts_client = create_tts_client(tts_provider, sample_rate=8000, frame_duration_ms=20)
         
         # Create session
         session = MediaSession(
@@ -515,6 +596,7 @@ class MediaService:
         if session_id in self.sessions:
             session = self.sessions[session_id]
             session.remote_addr = (remote_host, remote_port)
+            session._rtp_ready.set()
             logger.info("Updated session RTP address", {
                 "session_id": session_id,
                 "remote_addr": session.remote_addr
@@ -591,28 +673,28 @@ async def update_rtp_address_handler(request: web.Request, service: MediaService
         updated = await service.update_session_rtp_address(session_id, remote_host, remote_port)
         
         if updated:
-            # Send initial silence packet to trigger RTP flow
+            # Send initial silence packet to trigger RTP flow in both directions.
             if session_id in service.sessions:
                 session = service.sessions[session_id]
-                if session.mode == "echo":
-                    silence = np.zeros(session.samples_per_frame, dtype=np.int16)
-                    try:
-                        await session._send_audio_frame(silence)
-                        logger.info("Sent initial silence packet to trigger RTP", {
-                            "session_id": session_id,
-                            "remote_addr": session.remote_addr
-                        })
-                    except Exception as e:
-                        import traceback
-                        error_details = {
-                            "session_id": session_id,
-                            "remote_addr": session.remote_addr,
-                            "socket_available": session.socket is not None,
-                            "error": str(e),
-                            "error_type": type(e).__name__,
-                        }
-                        logger.warning(f"Could not send initial silence packet: {json.dumps(error_details)}")
-                        logger.debug(f"Traceback: {traceback.format_exc()}")
+                silence = np.zeros(session.samples_per_frame, dtype=np.int16)
+                try:
+                    await session._send_audio_frame(silence)
+                    logger.info("Sent initial silence packet to trigger RTP", {
+                        "session_id": session_id,
+                        "remote_addr": session.remote_addr,
+                        "mode": session.mode,
+                    })
+                except Exception as e:
+                    import traceback
+                    error_details = {
+                        "session_id": session_id,
+                        "remote_addr": session.remote_addr,
+                        "socket_available": session.socket is not None,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    }
+                    logger.warning(f"Could not send initial silence packet: {json.dumps(error_details)}")
+                    logger.debug(f"Traceback: {traceback.format_exc()}")
             
             return web.json_response({
                 "session_id": session_id,

@@ -21,8 +21,24 @@ Environment variables:
 - `MEDIA_MODE`: Operation mode - `echo`, `tts_only`, or `full` (default: `full`)
 - `ASR_PROVIDER`: ASR provider - `mock` or real provider (default: `mock`)
 - `LLM_PROVIDER`: LLM provider - `mock` or real provider (default: `mock`)
-- `TTS_PROVIDER`: TTS provider - `mock` or real provider (default: `mock`)
+- `TTS_PROVIDER`: TTS provider - `mock` or `http` (default: `mock`)
 - `SYSTEM_PROMPT`: System prompt for LLM (default: "You are a helpful assistant.")
+- `GREETING_TEXT`: Initial greeting spoken in `tts_only` / `full` mode (default: "Hello! I'm ready to help. How can I assist you today?")
+
+### TTS_PROVIDER=http
+
+Env vars:
+
+- `TTS_BASE_URL`: Base URL for a TTS HTTP server (required). Defaults to using an OpenAI-style endpoint at `/v1/audio/speech`.
+- `TTS_API_KEY`: Bearer token (optional).
+- `TTS_VOICE`: Voice name (default: `alloy`).
+- `TTS_TIMEOUT_MS`: Request timeout (default: `30000`).
+
+Optional:
+
+- `TTS_MODEL`: Model name sent in the request (default: `tts-1`).
+- `TTS_RESPONSE_FORMAT`: `pcm` (raw PCM16, some providers) or `wav` (e.g. Orpheus-FastAPI). Default: `pcm`. WAV is auto-detected too.
+- `TTS_SOURCE_SAMPLE_RATE`: Sample rate of returned PCM when `response_format="pcm"` (default: `24000`). The service resamples to 8kHz internally.
 
 ## Installation
 
