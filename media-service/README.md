@@ -20,9 +20,34 @@ Environment variables:
 - `MEDIA_PORT_BASE`: Base port for sessions (default: `40000`)
 - `MEDIA_MODE`: Operation mode - `echo`, `tts_only`, or `full` (default: `full`)
 - `ASR_PROVIDER`: ASR provider - `mock` or real provider (default: `mock`)
-- `LLM_PROVIDER`: LLM provider - `mock` or real provider (default: `mock`)
+- `LLM_PROVIDER`: LLM provider - `mock` or `openai_compat` (default: `mock`)
 - `TTS_PROVIDER`: TTS provider - `mock` or real provider (default: `mock`)
-- `SYSTEM_PROMPT`: System prompt for LLM (default: "You are a helpful assistant.")
+- `SYSTEM_PROMPT`: System prompt for LLM (short string; default: "You are a helpful assistant.")
+- `SYSTEM_PROMPT_FILE`: Path to a prompt file (recommended for long prompts). If set, it overrides `SYSTEM_PROMPT`.
+- `RESPONSE_LANGUAGE`: If set, forces the assistant to respond in this language (e.g. `French`, `français`, `fr`).
+
+### `.env` auto-loading
+
+This service will automatically load environment variables from:
+
+- repo root: `.env`
+- or `media-service/.env`
+
+Process environment variables still take precedence (they are **not** overwritten).
+
+Tip: for long system prompts, put the text in a file under `media-service/prompts/` and set `SYSTEM_PROMPT_FILE`.
+
+### OpenAI-compatible LLM provider
+
+Set `LLM_PROVIDER=openai_compat` to use an OpenAI-compatible Chat Completions endpoint.
+
+Additional environment variables:
+
+- `LLM_BASE_URL`: Base URL for the OpenAI-compatible server (default: `https://api.openai.com`)
+  - Examples: `https://api.openai.com`, `https://api.openai.com/v1`, `http://localhost:11434/v1`
+- `LLM_API_KEY`: API key (optional for some local servers; required for OpenAI)
+- `LLM_MODEL`: Model name (default: `gpt-4o-mini`)
+- `LLM_TIMEOUT_MS`: Request timeout in milliseconds (default: `30000`)
 
 ## Installation
 
@@ -35,6 +60,23 @@ pip install -r requirements.txt
 
 ```bash
 # From media-service directory
+python -m src.media_service
+```
+
+Example (OpenAI-compatible):
+
+```bash
+set LLM_PROVIDER=openai_compat
+set LLM_BASE_URL=https://api.openai.com
+set LLM_API_KEY=YOUR_KEY
+set LLM_MODEL=gpt-4o-mini
+set LLM_TIMEOUT_MS=30000
+python -m src.media_service
+```
+
+Or put the same values in `media-service/.env` and just run:
+
+```bash
 python -m src.media_service
 ```
 
