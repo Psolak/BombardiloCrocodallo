@@ -2,3 +2,4 @@ numpy>=1.24.0
 scipy>=1.10.0
 webrtcvad>=2.0.10
 aiohttp>=3.9.0
+python-dotenv>=1.0.0

@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import socket
+from pathlib import Path
 from typing import Optional
 import numpy as np
 from aiohttp import web
@@ -16,6 +17,123 @@ from .rtp_handler import RTPHandler
 from .audio_codec import ulaw_to_linear, linear_to_ulaw
 from .vad import EnergyVAD
 from .ai_providers import create_asr_client, create_llm_client, create_tts_client, ASRClient, LLMClient, TTSClient
+
+def _resolve_path_candidates(p: str) -> list[Path]:
+    raw = (p or "").strip().strip('"').strip("'")
+    if not raw:
+        return []
+
+    path = Path(raw)
+    if path.is_absolute():
+        return [path]
+
+    try:
+        this_file = Path(__file__).resolve()
+        media_service_dir = this_file.parent.parent  # .../media-service
+        repo_root = media_service_dir.parent
+    except Exception:
+        media_service_dir = None
+        repo_root = None
+
+    candidates: list[Path] = []
+    candidates.append(Path.cwd() / path)
+    if media_service_dir:
+        candidates.append(media_service_dir / path)
+    if repo_root:
+        candidates.append(repo_root / path)
+    return candidates
+
+
+def get_system_prompt() -> str:
+    """
+    Resolve the system prompt from env.
+
+    Priority:
+    - SYSTEM_PROMPT_FILE (file contents)
+    - SYSTEM_PROMPT (plain string)
+    - default prompt
+    """
+    prompt_file = os.getenv("SYSTEM_PROMPT_FILE")
+    response_language = (os.getenv("RESPONSE_LANGUAGE") or "").strip()
+
+    def _apply_language(p: str) -> str:
+        if not response_language:
+            return p
+        # Keep this as a small, deterministic suffix so the prompt file can remain clean.
+        return (
+            f"{p.strip()}\n\n"
+            "Output language:\n"
+            f"- Always respond in {response_language}.\n"
+            f"- Use natural, idiomatic, grammatically correct {response_language}.\n"
+            f"- Do not invent words; avoid malformed or pseudo-{response_language}.\n"
+            "- Keep responses coherent and answer the user's question.\n"
+            "- Avoid English except for proper nouns / technical terms.\n"
+        ).strip()
+    if prompt_file:
+        for candidate in _resolve_path_candidates(prompt_file):
+            try:
+                if candidate.exists() and candidate.is_file():
+                    text = candidate.read_text(encoding="utf-8")
+                    if text.strip():
+                        logger.info("Loaded system prompt from file", {"path": str(candidate)})
+                        return _apply_language(text)
+            except Exception:
+                continue
+
+        raise RuntimeError(
+            f"SYSTEM_PROMPT_FILE was set but could not be read: {prompt_file} "
+            f"(tried: {[str(p) for p in _resolve_path_candidates(prompt_file)]})"
+        )
+
+    prompt = os.getenv("SYSTEM_PROMPT")
+    if prompt and prompt.strip():
+        return _apply_language(prompt)
+
+    return _apply_language("You are a helpful assistant.")
+
+
+def _load_dotenv_if_present() -> None:
+    """
+    Load environment variables from .env files (if present).
+
+    We try, in order:
+    - repo root `.env` (parent of `media-service/`)
+    - `media-service/.env`
+
+    This lets you run from either repo root or the media-service directory.
+    """
+    try:
+        from dotenv import load_dotenv
+    except Exception:
+        # Optional at runtime; required if you want .env loading.
+        return
+
+    try:
+        this_file = Path(__file__).resolve()
+        media_service_dir = this_file.parent.parent  # .../media-service
+        repo_root = media_service_dir.parent
+
+        candidates = [
+            repo_root / ".env",
+            media_service_dir / ".env",
+        ]
+
+        loaded_any = False
+        for p in candidates:
+            if p.exists() and p.is_file():
+                # Do not override already-set env vars (process env wins).
+                load_dotenv(dotenv_path=str(p), override=False)
+                loaded_any = True
+
+        # We intentionally don't log which vars were loaded to avoid leaking secrets.
+        if loaded_any:
+            logging.getLogger(__name__).info(".env loaded (process env takes precedence)")
+    except Exception:
+        # Never block service startup because of dotenv.
+        return
+
+
+_load_dotenv_if_present()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,7 +193,7 @@ class MediaSession:
         self._receive_task: Optional[asyncio.Task] = None
         
         # System prompt
-        system_prompt = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
+        system_prompt = get_system_prompt()
         self.conversation_history.append({"role": "system", "content": system_prompt})
     
     async def start(self):
@@ -483,8 +601,9 @@ class MediaService:
         tts_provider = os.getenv("TTS_PROVIDER", "mock")
         
         asr_client = create_asr_client(asr_provider)
+        system_prompt = get_system_prompt()
         llm_client = create_llm_client(llm_provider, 
-                                      system_prompt=os.getenv("SYSTEM_PROMPT", "You are a helpful assistant."))
+                                      system_prompt=system_prompt)
         tts_client = create_tts_client(tts_provider, sample_rate=8000)
         
         # Create session
