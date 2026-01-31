@@ -11,6 +11,7 @@ import math
 import os
 import time
 import io
+import wave
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -245,6 +246,7 @@ class OpenAICompatLLMClient(LLMClient):
     - LLM_API_KEY: API key (optional for some local servers)
     - LLM_MODEL: model name (default: gpt-4o-mini)
     - LLM_TIMEOUT_MS: request timeout in milliseconds (default: 30000)
+    - LLM_MAX_TOKENS: cap output tokens (optional)
     """
 
     def __init__(
@@ -255,6 +257,7 @@ class OpenAICompatLLMClient(LLMClient):
         model: Optional[str] = None,
         timeout_ms: Optional[int] = None,
         temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ):
         self.system_prompt = system_prompt
 
@@ -275,6 +278,13 @@ class OpenAICompatLLMClient(LLMClient):
         except ValueError:
             env_timeout_ms = None
         self.timeout_ms = timeout_ms if timeout_ms is not None else (env_timeout_ms or 30000)
+
+        env_max_tokens = os.getenv("LLM_MAX_TOKENS")
+        try:
+            env_max = int(env_max_tokens) if env_max_tokens else None
+        except ValueError:
+            env_max = None
+        self.max_tokens = max_tokens if max_tokens is not None else env_max
 
         # Basic validation (no secrets in messages)
         try:
@@ -300,6 +310,8 @@ class OpenAICompatLLMClient(LLMClient):
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
+        if isinstance(self.max_tokens, int) and self.max_tokens > 0:
+            payload["max_tokens"] = self.max_tokens
 
         timeout_s = max(0.1, float(self.timeout_ms) / 1000.0)
         timeout = aiohttp.ClientTimeout(total=timeout_s)
@@ -569,15 +581,222 @@ class HttpTTSClient(TTSClient):
             yield frame.astype(np.dtype("<i2"), copy=False).tobytes()
 
 
+# ASR HTTP adapter
+
+class HttpASRClient(ASRClient):
+    """
+    HTTP ASR adapter using an OpenAI Whisper-style transcription endpoint.
+
+    Endpoint shape:
+      POST {ASR_BASE_URL}/v1/audio/transcriptions
+      multipart/form-data:
+        - file: audio file (we send WAV PCM16 mono)
+        - model: model name (e.g. whisper-1)
+        - language (optional)
+        - prompt (optional)
+
+    Notes:
+    - This client buffers audio in memory (no true streaming). `get_partial()` returns None.
+    - `get_final()` performs a transcription request once, returning the transcript text.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: Optional[str],
+        model: str = "whisper-1",
+        timeout_ms: int = 30000,
+        sample_rate: int = 8000,
+        wav_sample_rate: int = 16000,
+        pad_to_ms: int = 1000,
+        language: Optional[str] = None,
+        prompt: Optional[str] = None,
+        min_audio_ms: int = 200,
+    ):
+        if aiohttp is None:
+            raise RuntimeError("aiohttp is required for HttpASRClient")
+        if np is None:
+            raise RuntimeError("numpy is required for HttpASRClient")
+        self.base_url = (base_url or "").rstrip("/")
+        self.api_key = api_key
+        self.model = (model or "whisper-1").strip()
+        self.timeout_ms = int(timeout_ms)
+        self.sample_rate = int(sample_rate)
+        self.wav_sample_rate = int(wav_sample_rate)
+        self.pad_to_ms = max(0, int(pad_to_ms))
+        self.language = (language or "").strip() or None
+        self.prompt = (prompt or "").strip() or None
+        self.min_audio_ms = max(0, int(min_audio_ms))
+
+        self._streams: dict[str, bytearray] = {}
+        self._final: dict[str, Optional[str]] = {}
+
+    def _transcriptions_url(self) -> str:
+        # Allow caller to pass either a base URL or a full endpoint.
+        if self.base_url.endswith("/v1/audio/transcriptions"):
+            return self.base_url
+        return f"{self.base_url}/v1/audio/transcriptions"
+
+    def _pcm16le_to_wav_bytes(self, pcm16le: bytes) -> bytes:
+        # PCM16 mono, little-endian. Optionally resample to 16kHz for Whisper quality.
+        pcm_bytes = pcm16le
+        out_rate = self.wav_sample_rate or self.sample_rate
+
+        if out_rate != self.sample_rate:
+            if resample_poly is None:
+                raise RuntimeError("scipy is required to resample audio for ASR")
+            src = np.frombuffer(pcm_bytes, dtype=np.dtype("<i2"))
+            if src.size:
+                x = src.astype(np.float32) / 32768.0
+                up = out_rate
+                down = self.sample_rate
+                g = math.gcd(up, down)
+                up //= g
+                down //= g
+                y = resample_poly(x, up, down).astype(np.float32)
+                out = np.clip(np.round(y * 32767.0), -32768, 32767).astype(np.int16)
+                pcm_bytes = out.astype(np.dtype("<i2"), copy=False).tobytes()
+
+        # whisper.cpp often expects ~>= 1s of audio; pad with silence if needed.
+        if self.pad_to_ms > 0:
+            min_samples = int(out_rate * (self.pad_to_ms / 1000.0))
+            min_bytes = max(0, min_samples * 2)  # PCM16 mono
+            if len(pcm_bytes) < min_bytes:
+                pcm_bytes = pcm_bytes + (b"\x00" * (min_bytes - len(pcm_bytes)))
+
+        bio = io.BytesIO()
+        with wave.open(bio, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(out_rate)
+            wf.writeframes(pcm_bytes)
+        return bio.getvalue()
+
+    def _min_audio_bytes(self) -> int:
+        # 16-bit mono => 2 bytes/sample
+        samples = int(self.sample_rate * (self.min_audio_ms / 1000.0))
+        return max(0, samples * 2)
+
+    async def start_stream(self) -> str:
+        stream_id = f"http_asr_{len(self._streams)}_{int(time.time() * 1000)}"
+        self._streams[stream_id] = bytearray()
+        self._final[stream_id] = None
+        return stream_id
+
+    async def send_audio(self, stream_id: str, audio: bytes) -> None:
+        buf = self._streams.get(stream_id)
+        if buf is None:
+            return
+        if not audio:
+            return
+        buf.extend(audio)
+
+    async def get_partial(self, stream_id: str) -> Optional[str]:
+        return None
+
+    async def get_final(self, stream_id: str) -> Optional[str]:
+        cached = self._final.get(stream_id)
+        if isinstance(cached, str) and cached.strip():
+            return cached
+
+        buf = self._streams.get(stream_id)
+        if not buf:
+            return None
+
+        if len(buf) < self._min_audio_bytes():
+            return None
+
+        url = self._transcriptions_url()
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        wav_bytes = self._pcm16le_to_wav_bytes(bytes(buf))
+        form = aiohttp.FormData()
+        form.add_field("model", self.model)
+        if self.language:
+            form.add_field("language", self.language)
+        if self.prompt:
+            form.add_field("prompt", self.prompt)
+        # Many servers accept response_format=json; keep default and parse robustly.
+        form.add_field(
+            "file",
+            wav_bytes,
+            filename="audio.wav",
+            content_type="audio/wav",
+        )
+
+        timeout_s = max(0.1, float(self.timeout_ms) / 1000.0)
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
+
+        started_at = time.perf_counter()
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, data=form) as resp:
+                body = await resp.text()
+                if resp.status < 200 or resp.status >= 300:
+                    raise RuntimeError(f"ASR HTTP {resp.status} from {url}: {body[:2000]}")
+
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        logger.info(
+            "ASR HTTP response received (provider=http, elapsed_ms=%s, bytes_in=%s, model=%s, url=%s)",
+            elapsed_ms,
+            len(buf),
+            self.model,
+            url,
+        )
+
+        # Expected OpenAI response: { "text": "..." }
+        text: Optional[str] = None
+        try:
+            data = json.loads(body)
+            t = data.get("text")
+            if isinstance(t, str):
+                text = t.strip()
+        except Exception:
+            # Some servers may respond plain-text; accept that as fallback.
+            text = body.strip() if isinstance(body, str) else None
+
+        self._final[stream_id] = text
+        return text
+
+    async def stop_stream(self, stream_id: str) -> None:
+        self._streams.pop(stream_id, None)
+        self._final.pop(stream_id, None)
+
+
 # Factory function to create providers based on env vars
 
 def create_asr_client(provider: str = "mock", **kwargs) -> ASRClient:
     """Create ASR client based on provider name."""
     if provider == "mock":
         return MockASRClient()
-    # Add real providers here
-    # elif provider == "deepgram":
-    #     return DeepgramASRClient(**kwargs)
+    elif provider == "http":
+        base_url = os.getenv("ASR_BASE_URL", "").strip()
+        if not base_url:
+            raise RuntimeError("ASR_BASE_URL is required for ASR_PROVIDER=http")
+        api_key = os.getenv("ASR_API_KEY")
+        model = os.getenv("ASR_MODEL", "whisper-1")
+        timeout_ms = int(os.getenv("ASR_TIMEOUT_MS", "30000"))
+        language = os.getenv("ASR_LANGUAGE")
+        prompt = os.getenv("ASR_PROMPT")
+        min_audio_ms = int(os.getenv("ASR_MIN_AUDIO_MS", "200"))
+        sample_rate = int(kwargs.get("sample_rate", os.getenv("ASR_SAMPLE_RATE", "8000")))
+        wav_sample_rate = int(os.getenv("ASR_WAV_SAMPLE_RATE", "16000"))
+        pad_to_ms = int(os.getenv("ASR_PAD_TO_MS", "1000"))
+        return HttpASRClient(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout_ms=timeout_ms,
+            sample_rate=sample_rate,
+            wav_sample_rate=wav_sample_rate,
+            pad_to_ms=pad_to_ms,
+            language=language,
+            prompt=prompt,
+            min_audio_ms=min_audio_ms,
+        )
+    # Add real providers here (e.g. deepgram, azure, etc.)
     else:
         logger.warning(f"Unknown ASR provider: {provider}, using mock")
         return MockASRClient()
