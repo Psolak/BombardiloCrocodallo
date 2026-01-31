@@ -2,6 +2,11 @@ services:
   asterisk:
     image: andrius/asterisk:18-current
     container_name: bombardilo-asterisk
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     ports:
       - "5060:5060/udp"  # SIP
       - "5060:5060/tcp"  # SIP TCP
@@ -20,7 +25,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 500s
     # Remove command override - let the image use its default entrypoint
     # The andrius/asterisk image handles startup automatically
 
@@ -29,17 +34,22 @@ services:
       context: ./orchestrator
       dockerfile: Dockerfile
     container_name: bombardilo-orchestrator
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     environment:
       - ARI_URL=http://asterisk:8088
       - ARI_USER=voicebot
       - ARI_PASS=voicebot_pass
       - ARI_APP=voicebot
       - MEDIA_HOST=media-service
-      - MEDIA_IP=172.18.0.2
+      - MEDIA_IP=media-service
       - MEDIA_PORT_BASE=40000
       - MEDIA_API_PORT=5000
       - MEDIA_API_URL=http://media-service:5000
-      - MEDIA_MODE=echo
+      - MEDIA_MODE=full
       - AUDIO_FORMAT=ulaw
       - LOG_LEVEL=debug
     depends_on:
@@ -56,6 +66,11 @@ services:
       context: ./media-service
       dockerfile: Dockerfile
     container_name: bombardilo-media-service
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     ports:
       - "40000-40050:40000-40050/udp"  # RTP ports for media sessions
       - "5000:5000/tcp"  # HTTP API
@@ -63,11 +78,36 @@ services:
       - MEDIA_HOST=0.0.0.0
       - MEDIA_PORT_BASE=40000
       - MEDIA_API_PORT=5000
-      - MEDIA_MODE=echo
-      - ASR_PROVIDER=mock
-      - LLM_PROVIDER=mock
-      - TTS_PROVIDER=mock
-      - SYSTEM_PROMPT=You are a helpful assistant.
+      - MEDIA_MODE=full
+      - ASR_PROVIDER=http
+      - ASR_BASE_URL=http://host.docker.internal:8081
+      - ASR_MODEL=whisper-1
+      - ASR_LANGUAGE=fr
+      - ASR_MIN_AUDIO_MS=300
+      - ASR_PAD_TO_MS=1200
+      - LLM_PROVIDER=openai_compat
+      - LLM_BASE_URL=http://host.docker.internal:11434
+      - LLM_MODEL=llama3.1
+      - LLM_TIMEOUT_MS=30000
+      - LLM_MAX_TOKENS=300
+      - MAX_SPOKEN_SENTENCES=5
+      - MAX_SPOKEN_CHARS=3000
+      - RTP_KEEPALIVE=1
+      - BARGE_IN_FRAMES=5
+      - BARGE_IN_BUFFER_MS=600
+      - RTP_RECV_TIMEOUT_S=1.0
+      - NO_RTP_FINALIZE_MS=1500
+      - SILENCE_FINALIZE_MS=1200
+      - MIN_SPEECH_FRAMES=10
+      - TTS_PROVIDER=http
+      - TTS_BASE_URL=http://host.docker.internal:5005
+      - TTS_API_KEY=not-needed
+      - TTS_MODEL=orpheus
+      - TTS_RESPONSE_FORMAT=wav
+      - TTS_VOICE=pierre
+      - GREETING_TEXT=Salut ! Je suis Bombardilo Crocodilo.
+      - SYSTEM_PROMPT_FILE=prompts/bombardilo_crocodilo.fr.md
+      - RESPONSE_LANGUAGE=French
     networks:
       - bombardilo-network
     restart: unless-stopped

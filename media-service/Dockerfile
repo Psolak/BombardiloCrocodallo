@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source
 COPY src ./src
 
+# Copy prompt files (optional but recommended)
+COPY prompts ./prompts
+
 # Set PYTHONPATH
 ENV PYTHONPATH=/app
 

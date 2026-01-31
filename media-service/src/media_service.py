@@ -12,9 +12,12 @@ from typing import Optional
 import numpy as np
 from aiohttp import web
 import json
+import io
+import re
+from collections import deque
 
 from .rtp_handler import RTPHandler
-from .audio_codec import ulaw_to_linear, linear_to_ulaw
+from .audio_codec import ulaw_to_linear, linear_to_ulaw, alaw_to_linear
 from .vad import EnergyVAD
 from .ai_providers import create_asr_client, create_llm_client, create_tts_client, ASRClient, LLMClient, TTSClient
 
@@ -191,6 +194,18 @@ class MediaSession:
         self.tts_active = False
         self.conversation_history: list[dict] = []
         self._receive_task: Optional[asyncio.Task] = None
+        self._rtp_ready = asyncio.Event()
+        self._greeting_task: Optional[asyncio.Task] = None
+        self._greeting_sent = False
+        self._was_speech = False
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._response_worker_task: Optional[asyncio.Task] = None
+        self._response_queue: "asyncio.Queue[str]" = asyncio.Queue()
+        self._barge_in_speech_frames = 0
+        self._no_rtp_silence_ms = 0
+        self._speech_frames = 0
+        self._silence_frames = 0
+        self._barge_in_buffer: "deque[bytes]" = deque()
         
         # System prompt
         system_prompt = get_system_prompt()
@@ -230,6 +245,10 @@ class MediaSession:
         # Start ASR stream if not in echo mode
         if self.mode != "echo":
             self.asr_stream_id = await self.asr_client.start_stream()
+
+        # Start response worker in "full" mode so the RTP receive loop never blocks on LLM/TTS.
+        if self.mode == "full":
+            self._response_worker_task = asyncio.create_task(self._response_worker_loop())
         
         # Start receive loop (store task reference to prevent garbage collection)
         try:
@@ -271,13 +290,59 @@ class MediaSession:
                 logger.warning(f"Could not send initial silence packet: {json.dumps(error_details)}")
                 logger.debug(f"Traceback: {traceback.format_exc()}")
         
-        # Send initial greeting if TTS-only or full mode
+        # Send initial greeting if TTS-only or full mode.
+        # IMPORTANT: only speak once RTP address is known, otherwise we may send to a placeholder.
         if self.mode in ["tts_only", "full"]:
-            await self._send_greeting()
+            self._greeting_task = asyncio.create_task(self._send_greeting_when_rtp_ready())
+
+        # RTP keepalive: some endpoints hang up if they don't receive RTP for ~30s.
+        # We send silent PCMU frames when we're otherwise idle.
+        keepalive = (os.getenv("RTP_KEEPALIVE", "1") or "").strip().lower() not in {"0", "false", "no", "off"}
+        if keepalive and self.mode != "echo":
+            self._keepalive_task = asyncio.create_task(self._rtp_keepalive_loop())
+
+    async def _rtp_keepalive_loop(self):
+        # Wait for RTP to be ready so we know where to send.
+        try:
+            await asyncio.wait_for(self._rtp_ready.wait(), timeout=15.0)
+        except asyncio.TimeoutError:
+            return
+
+        silence = np.zeros(self.samples_per_frame, dtype=np.int16)
+        while self.running:
+            try:
+                # Only send silence when we're not actively speaking.
+                if not self.tts_active:
+                    await self._send_audio_frame(silence)
+                await asyncio.sleep(self.frame_duration_ms / 1000.0)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # Never crash the session because of keepalive.
+                await asyncio.sleep(0.1)
     
+    async def _send_greeting_when_rtp_ready(self):
+        try:
+            await asyncio.wait_for(self._rtp_ready.wait(), timeout=15.0)
+        except asyncio.TimeoutError:
+            logger.warning("RTP not ready; skipping greeting", {
+                "session_id": self.session_id,
+                "remote_addr": self.remote_addr,
+            })
+            return
+
+        if not self.running or self._greeting_sent:
+            return
+
+        self._greeting_sent = True
+        await self._send_greeting()
+
     async def _send_greeting(self):
         """Send initial greeting via TTS."""
-        greeting = "Hello! I'm ready to help. How can I assist you today?"
+        greeting = os.getenv(
+            "GREETING_TEXT",
+            "Hello! I'm ready to help. How can I assist you today?",
+        )
         await self._synthesize_and_send(greeting)
     
     async def _receive_loop(self):
@@ -302,8 +367,19 @@ class MediaSession:
             raise
         
         packet_count = 0
-        no_packet_warnings = 0
-        last_warning_time = asyncio.get_event_loop().time()
+        last_packet_time = asyncio.get_event_loop().time()
+        last_no_rtp_log_time = last_packet_time
+        recv_timeout_s = float(os.getenv("RTP_RECV_TIMEOUT_S", "1.0") or "1.0")
+        try:
+            no_rtp_warn_after_s = float(os.getenv("RTP_NO_RTP_WARN_AFTER_S", "15"))
+        except ValueError:
+            no_rtp_warn_after_s = 15.0
+        try:
+            no_rtp_warn_every_s = float(os.getenv("RTP_NO_RTP_WARN_EVERY_S", "15"))
+        except ValueError:
+            no_rtp_warn_every_s = 15.0
+        no_rtp_warn_after_s = max(1.0, no_rtp_warn_after_s)
+        no_rtp_warn_every_s = max(1.0, no_rtp_warn_every_s)
         
         while self.running:
             try:
@@ -311,21 +387,31 @@ class MediaSession:
                 try:
                     data, addr = await asyncio.wait_for(
                         loop.sock_recvfrom(self.socket, 1500),
-                        timeout=5.0
+                        timeout=recv_timeout_s
                     )
-                    no_packet_warnings = 0  # Reset counter on successful receive
+                    self._no_rtp_silence_ms = 0
+                    now = asyncio.get_event_loop().time()
+                    # If we were in a long RTP gap, log resumption once.
+                    gap_s = now - last_packet_time
+                    if packet_count > 0 and gap_s >= no_rtp_warn_after_s:
+                        logger.info("RTP resumed after %.1fs (session_id=%s)", gap_s, self.session_id)
+                    last_packet_time = now
                 except asyncio.TimeoutError:
-                    # No packet received in 5 seconds - log periodically
+                    # No RTP received during the timeout window.
+                    await self._handle_no_rtp(timeout_s=recv_timeout_s)
                     current_time = asyncio.get_event_loop().time()
-                    if current_time - last_warning_time >= 10.0:  # Warn every 10 seconds
-                        logger.warning("No RTP packets received", {
-                            "session_id": self.session_id,
-                            "local_port": self.local_port,
-                            "remote_addr": self.remote_addr,
-                            "seconds_waiting": int(current_time - last_warning_time),
-                            "packet_count": packet_count
-                        })
-                        last_warning_time = current_time
+                    since_last_packet = current_time - last_packet_time
+                    if self._rtp_ready.is_set() and since_last_packet >= no_rtp_warn_after_s:
+                        if current_time - last_no_rtp_log_time >= no_rtp_warn_every_s:
+                            logger.warning(
+                                "No RTP packets received for %.1fs (session_id=%s, local_port=%s, remote_addr=%s). "
+                                "This is often normal during silence with VAD-enabled endpoints.",
+                                since_last_packet,
+                                self.session_id,
+                                self.local_port,
+                                self.remote_addr,
+                            )
+                            last_no_rtp_log_time = current_time
                     continue
                 
                 packet_count += 1
@@ -336,6 +422,7 @@ class MediaSession:
                         "from_addr": addr,
                         "packet_size": len(data)
                     })
+                    self._rtp_ready.set()
                 
                 # Update remote address if changed
                 if addr != self.remote_addr:
@@ -345,6 +432,7 @@ class MediaSession:
                         "new_addr": addr
                     })
                     self.remote_addr = addr
+                    self._rtp_ready.set()
                 
                 # Parse RTP packet
                 result = self.rtp_handler.parse_packet(data)
@@ -356,12 +444,13 @@ class MediaSession:
                         })
                     continue
                 
-                sequence, payload = result
+                sequence, pt, payload = result
                 
                 if packet_count <= 5:
                     logger.debug("RTP packet parsed successfully", {
                         "session_id": self.session_id,
                         "sequence": sequence,
+                        "pt": pt,
                         "payload_size": len(payload)
                     })
 
@@ -387,8 +476,21 @@ class MediaSession:
                             "error_type": type(e).__name__
                         })
                 else:
-                    # Decode ulaw to PCM16 for VAD/ASR pipeline
-                    pcm_audio = ulaw_to_linear(payload)
+                    # Decode to PCM16 for VAD/ASR pipeline based on RTP payload type.
+                    # 0 = PCMU (ulaw), 8 = PCMA (alaw)
+                    if pt == 0:
+                        pcm_audio = ulaw_to_linear(payload)
+                    elif pt == 8:
+                        pcm_audio = alaw_to_linear(payload)
+                    else:
+                        if packet_count <= 20:
+                            logger.warning("Unsupported RTP payload type; dropping packet", {
+                                "session_id": self.session_id,
+                                "pt": pt,
+                                "sequence": sequence,
+                                "payload_bytes": len(payload),
+                            })
+                        continue
                     await self._process_audio_frame(pcm_audio)
                     
             except asyncio.CancelledError:
@@ -406,39 +508,209 @@ class MediaSession:
             "session_id": self.session_id,
             "total_packets": packet_count
         })
+
+    async def _handle_no_rtp(self, *, timeout_s: float) -> None:
+        """
+        Some endpoints stop sending RTP during silence.
+        If we previously detected speech, treat "no RTP" as silence and finalize ASR.
+        """
+        if self.mode in {"echo", "tts_only"}:
+            return
+        if self.tts_active:
+            return
+        if not self.asr_stream_id:
+            return
+        if not self._was_speech:
+            return
+
+        # Accumulate "silence" time based on missing RTP windows.
+        self._no_rtp_silence_ms += int(timeout_s * 1000)
+        try:
+            finalize_ms = int(os.getenv("NO_RTP_FINALIZE_MS", "1500"))
+        except ValueError:
+            finalize_ms = 1500
+        finalize_ms = max(100, finalize_ms)
+
+        if self._no_rtp_silence_ms < finalize_ms:
+            return
+
+        # Avoid chunking: require a minimum amount of speech before finalizing.
+        try:
+            min_speech_frames = int(os.getenv("MIN_SPEECH_FRAMES", "10"))
+        except ValueError:
+            min_speech_frames = 10
+        min_speech_frames = max(1, min_speech_frames)
+        if self._speech_frames < min_speech_frames:
+            self._no_rtp_silence_ms = 0
+            self._was_speech = False
+            self._speech_frames = 0
+            self._silence_frames = 0
+            return
+
+        logger.info(
+            "Finalizing ASR due to no RTP (session_id=%s, no_rtp_silence_ms=%s, finalize_ms=%s)",
+            self.session_id,
+            self._no_rtp_silence_ms,
+            finalize_ms,
+        )
+
+        self._no_rtp_silence_ms = 0
+
+        try:
+            final_text = await self.asr_client.get_final(self.asr_stream_id)
+        except Exception as e:
+            logger.error("ASR get_final failed (no RTP finalize)", {
+                "session_id": self.session_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            })
+            final_text = None
+
+        if final_text:
+            logger.info("ASR final result (session_id=%s): %s", self.session_id, final_text)
+            await self._enqueue_user_message(final_text)
+
+        # Reset stream + VAD after utterance.
+        try:
+            await self.asr_client.stop_stream(self.asr_stream_id)
+        except Exception:
+            pass
+        self.asr_stream_id = await self.asr_client.start_stream()
+        try:
+            self.vad.reset()
+        except Exception:
+            pass
+        self._was_speech = False
+        self._speech_frames = 0
+        self._silence_frames = 0
     
     async def _process_audio_frame(self, pcm_audio: np.ndarray):
         """Process audio frame with VAD and AI."""
+        if self.mode == "tts_only":
+            # In this mode we only speak the greeting and ignore input audio.
+            return
+
         # Run VAD
         is_speech = self.vad.process_frame(pcm_audio)
+
+        # While TTS is playing, do NOT feed audio to ASR (echo/loopback can pollute transcription).
+        # We only listen for "barge-in" (user starts speaking) and then stop TTS + reset ASR.
+        if self.tts_active:
+            # Keep a short buffer of inbound audio so we don't miss the beginning of barge-in speech.
+            try:
+                buffer_ms = int(os.getenv("BARGE_IN_BUFFER_MS", "600"))
+            except ValueError:
+                buffer_ms = 600
+            buffer_ms = max(0, buffer_ms)
+            max_frames = max(0, int(buffer_ms / self.frame_duration_ms))
+            if max_frames > 0:
+                self._barge_in_buffer.append(pcm_audio.astype(np.dtype("<i2"), copy=False).tobytes())
+                while len(self._barge_in_buffer) > max_frames:
+                    self._barge_in_buffer.popleft()
+
+            if is_speech:
+                self._barge_in_speech_frames += 1
+            else:
+                self._barge_in_speech_frames = 0
+
+            try:
+                required = int(os.getenv("BARGE_IN_FRAMES", "5"))
+            except ValueError:
+                required = 5
+            required = max(1, required)
+
+            if is_speech and self._barge_in_speech_frames >= required:
+                logger.info("Barge-in detected, stopping TTS", {"session_id": self.session_id})
+                self.tts_active = False
+                self._barge_in_speech_frames = 0
+                self._was_speech = False
+                try:
+                    self.vad.reset()
+                except Exception:
+                    pass
+
+                # Ensure ASR stream exists, then flush buffered audio so STT catches the beginning.
+                if not self.asr_stream_id:
+                    self.asr_stream_id = await self.asr_client.start_stream()
+
+                if self.asr_stream_id and self._barge_in_buffer:
+                    for chunk in self._barge_in_buffer:
+                        await self.asr_client.send_audio(self.asr_stream_id, chunk)
+                    self._barge_in_buffer.clear()
+                    self._was_speech = True
+                    self._speech_frames += 1
+                    self._silence_frames = 0
+            return
+        else:
+            self._barge_in_speech_frames = 0
+            self._barge_in_buffer.clear()
         
         if is_speech:
             # Speech detected
-            if self.tts_active:
-                # Barge-in: stop TTS and resume ASR
-                logger.info(f"Barge-in detected, stopping TTS", {
-                    "session_id": self.session_id
-                })
-                self.tts_active = False
-                # Restart ASR stream
-                if self.asr_stream_id:
-                    await self.asr_client.stop_stream(self.asr_stream_id)
-                self.asr_stream_id = await self.asr_client.start_stream()
-            
             # Send audio to ASR
             if self.asr_stream_id:
                 await self.asr_client.send_audio(self.asr_stream_id, pcm_audio.tobytes())
-                
-                # Check for final transcription
-                final_text = await self.asr_client.get_final(self.asr_stream_id)
-                if final_text:
-                    logger.info(f"ASR final result", {
-                        "session_id": self.session_id,
-                        "text": final_text
-                    })
-                    await self._handle_user_message(final_text)
+                self._was_speech = True
+                self._speech_frames += 1
+                self._silence_frames = 0
         else:
-            # No speech, check for partial results
+            if self._was_speech:
+                self._silence_frames += 1
+
+            # Speech ended: finalize only after a sustained silence gap (avoid chunking on micro-pauses).
+            if self._was_speech and self.asr_stream_id and not self.tts_active:
+                try:
+                    silence_finalize_ms = int(os.getenv("SILENCE_FINALIZE_MS", "1200"))
+                except ValueError:
+                    silence_finalize_ms = 1200
+                silence_finalize_ms = max(100, silence_finalize_ms)
+                silence_finalize_frames = max(1, int(silence_finalize_ms / self.frame_duration_ms))
+
+                try:
+                    min_speech_frames = int(os.getenv("MIN_SPEECH_FRAMES", "10"))
+                except ValueError:
+                    min_speech_frames = 10
+                min_speech_frames = max(1, min_speech_frames)
+
+                if self._speech_frames < min_speech_frames:
+                    # Too short; treat as noise and reset.
+                    self._was_speech = False
+                    self._speech_frames = 0
+                    self._silence_frames = 0
+                elif self._silence_frames >= silence_finalize_frames:
+                    try:
+                        final_text = await self.asr_client.get_final(self.asr_stream_id)
+                    except Exception as e:
+                        logger.error("ASR get_final failed", {
+                            "session_id": self.session_id,
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                        })
+                        final_text = None
+
+                    if final_text:
+                        logger.info("ASR final result (session_id=%s): %s", self.session_id, final_text)
+                        await self._enqueue_user_message(final_text)
+
+                    # Always reset stream after an utterance ends to avoid growing buffers.
+                    try:
+                        await self.asr_client.stop_stream(self.asr_stream_id)
+                    except Exception:
+                        pass
+                    self.asr_stream_id = await self.asr_client.start_stream()
+                    try:
+                        self.vad.reset()
+                    except Exception:
+                        pass
+                    self._speech_frames = 0
+                    self._silence_frames = 0
+
+            # If we're in silence but haven't finalized yet, keep _was_speech=True so we can finalize later.
+            if not self._was_speech:
+                self._speech_frames = 0
+                self._silence_frames = 0
+
+            # No speech, check for partial results (if supported by provider)
             if self.asr_stream_id and not self.tts_active:
                 partial_text = await self.asr_client.get_partial(self.asr_stream_id)
                 if partial_text:
@@ -459,6 +731,8 @@ class MediaSession:
                 "session_id": self.session_id,
                 "response": response
             })
+
+            response = self._truncate_spoken_response(response)
             
             # Add to conversation history
             self.conversation_history.append({"role": "assistant", "content": response})
@@ -471,6 +745,101 @@ class MediaSession:
                 "session_id": self.session_id,
                 "error": str(e)
             })
+
+    async def _enqueue_user_message(self, text: str) -> None:
+        """
+        Enqueue a finalized user utterance for response generation.
+
+        Critical: the RTP receive loop must not block on LLM/TTS, otherwise we stop
+        consuming RTP and the call "goes deaf" after the first exchange.
+        """
+        if self.mode != "full":
+            return
+        s = (text or "").strip()
+        if not s:
+            return
+        if not self.running:
+            return
+
+        try:
+            max_pending = int(os.getenv("MAX_PENDING_UTTERANCES", "3"))
+        except ValueError:
+            max_pending = 3
+        max_pending = max(1, max_pending)
+
+        if self._response_queue.qsize() >= max_pending:
+            logger.warning("Dropping user utterance: response queue full", {
+                "session_id": self.session_id,
+                "max_pending": max_pending,
+            })
+            return
+
+        await self._response_queue.put(s)
+
+    async def _response_worker_loop(self) -> None:
+        """Sequentially generate responses (LLM) and speak them (TTS)."""
+        while self.running:
+            try:
+                text = await self._response_queue.get()
+            except asyncio.CancelledError:
+                break
+
+            try:
+                if text and self.running:
+                    await self._handle_user_message(text)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Response worker error", {
+                    "session_id": self.session_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                })
+            finally:
+                try:
+                    self._response_queue.task_done()
+                except Exception:
+                    pass
+
+    def _truncate_spoken_response(self, text: str) -> str:
+        """
+        Hard limit what we send to TTS so audio stays short.
+
+        Env vars:
+        - MAX_SPOKEN_SENTENCES (default: 1)
+        - MAX_SPOKEN_CHARS (default: 160)
+        """
+        s = (text or "").strip()
+        if not s:
+            return ""
+
+        try:
+            max_sentences = int(os.getenv("MAX_SPOKEN_SENTENCES", "1"))
+        except ValueError:
+            max_sentences = 1
+        try:
+            max_chars = int(os.getenv("MAX_SPOKEN_CHARS", "160"))
+        except ValueError:
+            max_chars = 160
+
+        max_sentences = max(1, max_sentences)
+        max_chars = max(20, max_chars)
+
+        # Split into sentences while keeping punctuation.
+        parts = re.split(r"(?<=[\.\!\?…])\s+", s)
+        parts = [p.strip() for p in parts if p and p.strip()]
+        if parts:
+            s2 = " ".join(parts[:max_sentences]).strip()
+        else:
+            s2 = s
+
+        if len(s2) > max_chars:
+            s2 = s2[:max_chars].rstrip()
+            # Avoid cutting in the middle of a word if we can.
+            s2 = re.sub(r"\s+\S*$", "", s2).rstrip()
+            if s2 and s2[-1] not in ".!?…":
+                s2 += "…"
+        return s2
     
     async def _synthesize_and_send(self, text: str):
         """Synthesize text to speech and send audio."""
@@ -481,29 +850,47 @@ class MediaSession:
         })
         
         try:
+            started_at = asyncio.get_event_loop().time()
+            first_audio_sent = False
             async for audio_chunk in self.tts_client.synthesize_stream(text):
                 if not self.tts_active:
                     # Barge-in occurred, stop sending
                     break
                 await self._send_audio_frame(audio_chunk)
+                if not first_audio_sent:
+                    first_audio_sent = True
+                    ttf_audio_ms = int((asyncio.get_event_loop().time() - started_at) * 1000)
+                    logger.info("TTS time-to-first-audio", {
+                        "session_id": self.session_id,
+                        "ttf_audio_ms": ttf_audio_ms
+                    })
+                # Pace RTP output to real-time frames (20ms)
+                await asyncio.sleep(self.frame_duration_ms / 1000.0)
             
             self.tts_active = False
             logger.info(f"TTS synthesis completed", {
                 "session_id": self.session_id
             })
         except Exception as e:
-            logger.error(f"Error in TTS synthesis", {
-                "session_id": self.session_id,
-                "error": str(e)
-            })
+            import traceback
+            # NOTE: logging format is message-only, so embed context/traceback in the message.
+            logger.error(
+                f"TTS synthesis failed (session_id={self.session_id}, error_type={type(e).__name__}, error={e})"
+            )
+            logger.error(f"TTS synthesis traceback (session_id={self.session_id}): {traceback.format_exc()}")
             self.tts_active = False
     
-    async def _send_audio_frame(self, pcm_audio: np.ndarray):
-        """Send audio frame as RTP packet."""
+    async def _send_audio_frame(self, pcm_audio: "np.ndarray | bytes | bytearray | memoryview"):
+        """Send a single 20ms PCM16 frame as RTP packet."""
+        if not self.running:
+            return
         if not self.socket:
             logger.warning("Cannot send audio: socket not available", {
                 "session_id": self.session_id
             })
+            return
+        if self.socket.fileno() < 0:
+            # Socket already closed (can happen during hangup/cleanup races).
             return
         
         if not self.remote_addr:
@@ -512,9 +899,21 @@ class MediaSession:
             })
             return
         
-        # Ensure correct dtype and shape
+        # Accept either bytes (PCM16 little-endian) or numpy int16 samples.
+        if isinstance(pcm_audio, (bytes, bytearray, memoryview)):
+            pcm_audio = np.frombuffer(pcm_audio, dtype=np.dtype("<i2"))
+        elif not isinstance(pcm_audio, np.ndarray):
+            raise TypeError(f"Unsupported pcm_audio type: {type(pcm_audio).__name__}")
+
+        # Ensure correct dtype
         if pcm_audio.dtype != np.int16:
-            pcm_audio = pcm_audio.astype(np.int16)
+            pcm_audio = pcm_audio.astype(np.int16, copy=False)
+
+        # Ensure exact 20ms frame length (pad or trim defensively)
+        if pcm_audio.size < self.samples_per_frame:
+            pcm_audio = np.pad(pcm_audio, (0, self.samples_per_frame - pcm_audio.size))
+        elif pcm_audio.size > self.samples_per_frame:
+            pcm_audio = pcm_audio[: self.samples_per_frame]
         
         # Encode PCM16 to ulaw
         ulaw_data = linear_to_ulaw(pcm_audio)
@@ -526,6 +925,22 @@ class MediaSession:
         try:
             loop = asyncio.get_event_loop()
             await loop.sock_sendto(self.socket, rtp_packet, self.remote_addr)
+        except OSError as e:
+            # Ignore "Bad file descriptor" if teardown raced with send.
+            if getattr(e, "errno", None) == 9:
+                return
+            import traceback
+            error_details = {
+                "session_id": self.session_id,
+                "remote_addr": self.remote_addr,
+                "remote_addr_type": type(self.remote_addr).__name__ if self.remote_addr else None,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+            logger.error(f"Error sending RTP packet: {json.dumps(error_details)}")
+            # NOTE: logging is configured to only print the message, so embed traceback in the message.
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return
         except Exception as e:
             import traceback
             error_details = {
@@ -543,6 +958,29 @@ class MediaSession:
     async def stop(self):
         """Stop the media session."""
         self.running = False
+        self.tts_active = False
+        self._rtp_ready.set()
+
+        if self._greeting_task and not self._greeting_task.done():
+            self._greeting_task.cancel()
+            try:
+                await self._greeting_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._response_worker_task and not self._response_worker_task.done():
+            self._response_worker_task.cancel()
+            try:
+                await self._response_worker_task
+            except asyncio.CancelledError:
+                pass
         
         # Cancel receive task
         if self._receive_task and not self._receive_task.done():
@@ -557,6 +995,7 @@ class MediaSession:
         
         if self.socket:
             self.socket.close()
+            self.socket = None
         
         logger.info(f"Media session stopped", {
             "session_id": self.session_id
@@ -600,11 +1039,17 @@ class MediaService:
         llm_provider = os.getenv("LLM_PROVIDER", "mock")
         tts_provider = os.getenv("TTS_PROVIDER", "mock")
         
-        asr_client = create_asr_client(asr_provider)
+        asr_client = create_asr_client(asr_provider, sample_rate=8000)
         system_prompt = get_system_prompt()
-        llm_client = create_llm_client(llm_provider, 
-                                      system_prompt=system_prompt)
-        tts_client = create_tts_client(tts_provider, sample_rate=8000)
+        llm_client = create_llm_client(
+            llm_provider,
+            system_prompt=system_prompt,
+        )
+        tts_client = create_tts_client(
+            tts_provider,
+            sample_rate=8000,
+            frame_duration_ms=20,
+        )
         
         # Create session
         session = MediaSession(
@@ -634,6 +1079,7 @@ class MediaService:
         if session_id in self.sessions:
             session = self.sessions[session_id]
             session.remote_addr = (remote_host, remote_port)
+            session._rtp_ready.set()
             logger.info("Updated session RTP address", {
                 "session_id": session_id,
                 "remote_addr": session.remote_addr
@@ -710,28 +1156,28 @@ async def update_rtp_address_handler(request: web.Request, service: MediaService
         updated = await service.update_session_rtp_address(session_id, remote_host, remote_port)
         
         if updated:
-            # Send initial silence packet to trigger RTP flow
+            # Send initial silence packet to trigger RTP flow in both directions.
             if session_id in service.sessions:
                 session = service.sessions[session_id]
-                if session.mode == "echo":
-                    silence = np.zeros(session.samples_per_frame, dtype=np.int16)
-                    try:
-                        await session._send_audio_frame(silence)
-                        logger.info("Sent initial silence packet to trigger RTP", {
-                            "session_id": session_id,
-                            "remote_addr": session.remote_addr
-                        })
-                    except Exception as e:
-                        import traceback
-                        error_details = {
-                            "session_id": session_id,
-                            "remote_addr": session.remote_addr,
-                            "socket_available": session.socket is not None,
-                            "error": str(e),
-                            "error_type": type(e).__name__,
-                        }
-                        logger.warning(f"Could not send initial silence packet: {json.dumps(error_details)}")
-                        logger.debug(f"Traceback: {traceback.format_exc()}")
+                silence = np.zeros(session.samples_per_frame, dtype=np.int16)
+                try:
+                    await session._send_audio_frame(silence)
+                    logger.info("Sent initial silence packet to trigger RTP", {
+                        "session_id": session_id,
+                        "remote_addr": session.remote_addr,
+                        "mode": session.mode,
+                    })
+                except Exception as e:
+                    import traceback
+                    error_details = {
+                        "session_id": session_id,
+                        "remote_addr": session.remote_addr,
+                        "socket_available": session.socket is not None,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    }
+                    logger.warning(f"Could not send initial silence packet: {json.dumps(error_details)}")
+                    logger.debug(f"Traceback: {traceback.format_exc()}")
             
             return web.json_response({
                 "session_id": session_id,
@@ -770,6 +1216,84 @@ async def health_handler(request: web.Request):
     return web.json_response({"status": "healthy"})
 
 
+async def stt_transcribe_handler(request: web.Request):
+    """
+    STT endpoint for quick testing without RTP.
+
+    Request: multipart/form-data with:
+      - file: WAV file (recommended)
+
+    Response: { "text": "...", "provider": "...", "bytes": N }
+    """
+    try:
+        if not request.content_type.startswith("multipart/"):
+            return web.json_response({"error": "multipart/form-data required (field: file)"}, status=400)
+
+        reader = await request.multipart()
+        file_field = await reader.next()
+        if file_field is None or file_field.name != "file":
+            return web.json_response({"error": "missing multipart field 'file'"}, status=400)
+
+        filename = (file_field.filename or "").lower()
+        raw = await file_field.read(decode=False)
+        if not raw:
+            return web.json_response({"error": "empty file"}, status=400)
+
+        # Decode WAV -> PCM16LE mono @ 8kHz (only WAV supported for now)
+        try:
+            from scipy.io import wavfile
+            from scipy.signal import resample_poly
+        except Exception:
+            return web.json_response({"error": "scipy is required to decode wav uploads"}, status=500)
+
+        if not (raw[:4] == b"RIFF" and raw[8:12] == b"WAVE") and not filename.endswith(".wav"):
+            return web.json_response({"error": "only .wav is supported (send a WAV file)"}, status=400)
+
+        rate, data = wavfile.read(io.BytesIO(raw))
+        pcm = data
+        if isinstance(pcm, np.ndarray) and pcm.ndim == 2:
+            pcm = pcm.astype(np.float32).mean(axis=1)
+
+        if isinstance(pcm, np.ndarray) and pcm.dtype != np.int16:
+            if pcm.dtype == np.int32:
+                pcm = np.clip(np.round(pcm.astype(np.float32) / 65536.0), -32768, 32767).astype(np.int16)
+            elif pcm.dtype == np.float32 or pcm.dtype == np.float64:
+                pcm = np.clip(np.round(pcm.astype(np.float32) * 32767.0), -32768, 32767).astype(np.int16)
+            else:
+                pcm = pcm.astype(np.int16, copy=False)
+
+        rate = int(rate)
+        if rate != 8000:
+            # Resample in float domain, then back to PCM16.
+            x = pcm.astype(np.float32) / 32768.0
+            up = 8000
+            down = rate
+            import math
+            g = math.gcd(up, down)
+            up //= g
+            down //= g
+            y = resample_poly(x, up, down).astype(np.float32)
+            pcm = np.clip(np.round(y * 32767.0), -32768, 32767).astype(np.int16)
+
+        pcm_bytes = pcm.astype(np.dtype("<i2"), copy=False).tobytes()
+
+        asr_provider = os.getenv("ASR_PROVIDER", "mock")
+        asr_client = create_asr_client(asr_provider, sample_rate=8000)
+        stream_id = await asr_client.start_stream()
+        await asr_client.send_audio(stream_id, pcm_bytes)
+        text = await asr_client.get_final(stream_id)
+        await asr_client.stop_stream(stream_id)
+
+        return web.json_response({
+            "text": text or "",
+            "provider": asr_provider,
+            "bytes": len(pcm_bytes),
+        })
+    except Exception as e:
+        logger.error("Error in STT transcribe handler", {"error": str(e), "error_type": type(e).__name__})
+        return web.json_response({"error": str(e)}, status=500)
+
+
 async def main():
     """Main entry point."""
     host = os.getenv("MEDIA_HOST", "127.0.0.1")
@@ -792,6 +1316,7 @@ async def main():
     app.router.add_put("/sessions/{session_id}/rtp-address", lambda r: update_rtp_address_handler(r, service))
     app.router.add_delete("/sessions", lambda r: stop_session_handler(r, service))
     app.router.add_get("/health", health_handler)
+    app.router.add_post("/stt/transcribe", stt_transcribe_handler)
     
     runner = web.AppRunner(app)
     await runner.setup()

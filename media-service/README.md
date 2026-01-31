@@ -21,10 +21,11 @@ Environment variables:
 - `MEDIA_MODE`: Operation mode - `echo`, `tts_only`, or `full` (default: `full`)
 - `ASR_PROVIDER`: ASR provider - `mock` or real provider (default: `mock`)
 - `LLM_PROVIDER`: LLM provider - `mock` or `openai_compat` (default: `mock`)
-- `TTS_PROVIDER`: TTS provider - `mock` or real provider (default: `mock`)
+- `TTS_PROVIDER`: TTS provider - `mock` or `http` (default: `mock`)
 - `SYSTEM_PROMPT`: System prompt for LLM (short string; default: "You are a helpful assistant.")
 - `SYSTEM_PROMPT_FILE`: Path to a prompt file (recommended for long prompts). If set, it overrides `SYSTEM_PROMPT`.
 - `RESPONSE_LANGUAGE`: If set, forces the assistant to respond in this language (e.g. `French`, `français`, `fr`).
+- `GREETING_TEXT`: Initial greeting spoken in `tts_only` / `full` mode (default: "Hello! I'm ready to help. How can I assist you today?")
 
 ### `.env` auto-loading
 
@@ -48,6 +49,46 @@ Additional environment variables:
 - `LLM_API_KEY`: API key (optional for some local servers; required for OpenAI)
 - `LLM_MODEL`: Model name (default: `gpt-4o-mini`)
 - `LLM_TIMEOUT_MS`: Request timeout in milliseconds (default: `30000`)
+
+### ASR_PROVIDER=http (Speech-to-Text)
+
+Set `ASR_PROVIDER=http` to use an OpenAI Whisper-style transcription endpoint.
+
+Env vars:
+
+- `ASR_BASE_URL`: Base URL for an OpenAI-compatible server (required).
+  - Examples: `https://api.openai.com`, `https://api.openai.com/v1`, `http://localhost:8000/v1`
+  - The service will POST to `/v1/audio/transcriptions` (unless you pass the full endpoint).
+- `ASR_API_KEY`: Bearer token (optional for some local servers; required for OpenAI).
+- `ASR_MODEL`: Model name (default: `whisper-1`).
+- `ASR_TIMEOUT_MS`: Request timeout (default: `30000`).
+
+Optional:
+
+- `ASR_LANGUAGE`: Language hint (e.g. `fr`, `en`).
+- `ASR_PROMPT`: Prompt/hints for transcription.
+- `ASR_MIN_AUDIO_MS`: Minimum buffered audio before attempting transcription (default: `200`).
+- `ASR_WAV_SAMPLE_RATE`: Sample rate used when sending WAV to the provider (default: `16000`). Input audio is 8kHz in RTP; we resample once per utterance for quality.
+- `ASR_PAD_TO_MS`: Pad each utterance with silence to at least this duration before sending to the provider (default: `1000`). This is useful for `whisper.cpp`, which often needs ~1s minimum input.
+
+Implementation detail:
+
+- In `MEDIA_MODE=full`, transcription is triggered on the VAD **speech → silence** transition (end-of-utterance), rather than polling every frame.
+
+### TTS_PROVIDER=http
+
+Env vars:
+
+- `TTS_BASE_URL`: Base URL for a TTS HTTP server (required). Defaults to using an OpenAI-style endpoint at `/v1/audio/speech`.
+- `TTS_API_KEY`: Bearer token (optional).
+- `TTS_VOICE`: Voice name (default: `alloy`).
+- `TTS_TIMEOUT_MS`: Request timeout (default: `30000`).
+
+Optional:
+
+- `TTS_MODEL`: Model name sent in the request (default: `tts-1`).
+- `TTS_RESPONSE_FORMAT`: `pcm` (raw PCM16, some providers) or `wav` (e.g. Orpheus-FastAPI). Default: `pcm`. WAV is auto-detected too.
+- `TTS_SOURCE_SAMPLE_RATE`: Sample rate of returned PCM when `response_format="pcm"` (default: `24000`). The service resamples to 8kHz internally.
 
 ## Installation
 
@@ -100,6 +141,22 @@ python src/media_service.py
 ### Full Mode
 - Full conversational loop: VAD → ASR → LLM → TTS
 - Barge-in support
+
+## STT HTTP endpoint (no RTP required)
+
+You can test speech-to-text without placing a call:
+
+- `POST /stt/transcribe`
+  - Request: `multipart/form-data` with a `file` field containing a **WAV** file.
+  - Response: `{ "text": "...", "provider": "...", "bytes": N }`
+
+## Local STT with `whisper.cpp` (Docker)
+
+This repo includes a `whispercpp/` service you can run with Docker Compose.
+
+- Start it: `docker compose up -d whispercpp`
+- It exposes the OpenAI-compatible endpoint at `http://localhost:8081/v1/audio/transcriptions`
+- From inside the Compose network, use `http://whispercpp:8080`
 
 ## Architecture
 

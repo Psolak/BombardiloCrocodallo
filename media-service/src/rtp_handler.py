@@ -71,12 +71,12 @@ class RTPHandler:
         self.expected_sequence = None
         self.max_jitter_buffer_size = 10  # Max 10 packets in buffer
     
-    def parse_packet(self, data: bytes) -> Optional[Tuple[int, bytes]]:
+    def parse_packet(self, data: bytes) -> Optional[Tuple[int, int, bytes]]:
         """
         Parse incoming RTP packet.
         
         Returns:
-            Tuple of (sequence_number, payload) or None if packet should be dropped
+            Tuple of (sequence_number, payload_type, payload) or None if packet should be dropped
         """
         try:
             packet = RTPPacket(data)
@@ -93,14 +93,20 @@ class RTPHandler:
                 self.expected_sequence = (packet.sequence + 1) % 65536
                 # Check if we can now return buffered packets
                 while self.expected_sequence in self.jitter_buffer:
-                    payload = self.jitter_buffer.pop(self.expected_sequence)
+                    blob = self.jitter_buffer.pop(self.expected_sequence)
                     self.expected_sequence = (self.expected_sequence + 1) % 65536
-                    # Return buffered packet first, then current
-                    return (packet.sequence, packet.payload)
-                return (packet.sequence, packet.payload)
+                    if not blob:
+                        continue
+                    pt = blob[0] & 0x7F
+                    payload = blob[1:]
+                    # Return buffered packet first, then current (simple behavior).
+                    return (packet.sequence, pt, payload)
+                return (packet.sequence, packet.pt, packet.payload)
             elif seq_diff < self.max_jitter_buffer_size:
                 # Out of order, buffer it
-                self.jitter_buffer[packet.sequence] = packet.payload
+                # Store payload with PT so we can decode correctly later.
+                # We pack as bytes: pt (1 byte) + payload.
+                self.jitter_buffer[packet.sequence] = bytes([packet.pt & 0x7F]) + packet.payload
                 # Clean up old entries
                 if len(self.jitter_buffer) > self.max_jitter_buffer_size:
                     oldest = min(self.jitter_buffer.keys())
